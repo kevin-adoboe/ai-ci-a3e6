@@ -1,0 +1,116 @@
+version: 2.1
+
+# ---------------------------------------------------------------------------
+# Why this config looks the way it does
+#
+# EXECUTOR IMAGE: cimg/node:22.23.2
+#   * Node 22, because the root package.json pins
+#     "engines": { "node": "^22.13.0 || ^24.0.0 || ^26.0.0" }. Node 22 is the
+#     lowest line this repo supports and is still active LTS, so it is the
+#     conservative choice: if it builds and tests green here it will also work
+#     on 24/26, but not necessarily the other way round.
+#   * The patch is pinned (22.23.2, newest cimg/node 22.x tag) rather than the
+#     floating "22" / "22.23" tags so a rebuilt image can never silently change
+#     the toolchain under a rerun. Bump it deliberately.
+#   * cimg/node (not plain node or cimg/base) because it ships git, openssh and
+#     — importantly — a pnpm binary on PATH. circleci/setup-node requires the
+#     package manager binary to already be on PATH; it does not install one.
+#     The image's pnpm then self-upgrades to the "packageManager":
+#     "pnpm@11.23.0" pin in package.json (pnpm's manage-package-manager-versions
+#     is on by default), so the lockfile is always read by the exact pnpm the
+#     repo expects.
+#   * Deliberately NOT the "-browsers" variant: nothing in the build or in the
+#     unit/edge test suites drives a real browser. The DOM-ish suites
+#     (@ai-sdk/react, /svelte, /vue, /angular, packages/rsc test:ui) all run on
+#     jsdom, and the one Playwright suite is skipped below. Pulling the browsers
+#     image would add ~1GB of image download for no benefit.
+#
+# RESOURCE CLASS: large (4 vCPU / 8 GB)
+#   This is a ~105-project pnpm workspace; the default "medium" (2 vCPU / 4 GB)
+#   makes the install + vitest fan-out painfully slow and puts the heavier
+#   suites (packages/ai) close to the memory ceiling. "large" is the smallest
+#   class that runs the whole thing comfortably.
+#
+# INSTALL STEP: circleci/setup-node ... -- install  (no flags)
+#   * No --app-dir: the lockfile (pnpm-lock.yaml) and package.json live at the
+#     repo root, which is already the function's default of ".".
+#   * No --package-manager: pnpm-lock.yaml at the root makes detection
+#     unambiguous, so letting it auto-detect keeps one less thing to update if
+#     the repo ever switches package managers.
+#   * No --override-command: the default frozen install ("pnpm install
+#     --frozen-lockfile") is exactly what CI wants — it fails loudly if the
+#     lockfile drifts from package.json instead of quietly resolving something
+#     new.
+#   * Caching is left at the default (--with-cache): the function restores and
+#     saves the pnpm store itself and keys the cache off a lockfile checksum.
+#     That is why there are no restore_cache / save_cache steps around it —
+#     adding them is explicitly unsupported and would fight the function.
+#
+# BUILD / TEST COMMANDS: turbo invoked directly, not via the package.json scripts
+#   * --filter='!@example/*' drops the 25 demo apps under examples/. They are
+#     not part of the published SDK and most of them expect provider API keys;
+#     building them would add minutes and a lot of flakiness to every push.
+#     Everything else (packages/*, tools/*) is built and tested.
+#   * --concurrency 4 instead of the repo scripts' hardcoded "--concurrency 16".
+#     16 is tuned for a developer laptop; on a 4 vCPU container it just
+#     oversubscribes the box (each vitest process forks its own workers on top)
+#     and increases peak memory for no wall-clock win.
+#   * We intentionally do NOT use the repo's own "pnpm test:ci", which also
+#     filters out "ai" and "@ai-sdk/codemod" (upstream shards those into
+#     separate jobs). Skipping the core "ai" package would mean this pipeline
+#     was not really running the test suite, so the filter here is examples only.
+#   * The explicit build step is somewhat redundant — turbo's "test" task
+#     dependsOn "build", so tests would build what they need anyway — but
+#     keeping it separate means a compile break is reported as a failed "Build"
+#     step instead of being buried in test output. The re-run in the test step
+#     is a turbo cache hit, so it costs seconds.
+#
+# ENVIRONMENT
+#   * SKIP_RSC_E2E=1 skips packages/rsc's Playwright suite (the repo wires this
+#     env var up in turbo.json for exactly this purpose). It needs Playwright
+#     browser binaries plus a Next.js server boot; that belongs in a dedicated
+#     job with "playwright install --with-deps", not in the push-gate job.
+#     Every other rsc suite (node, edge, jsdom ui) still runs.
+#   * The *_TELEMETRY_DISABLED / DO_NOT_TRACK vars keep turbo and Next from
+#     making network calls we do not need on a CI box.
+#
+# TIMEOUTS
+#   no_output_timeout is raised above the 10m default on build and test. turbo
+#   streams task output, but a single heavy package (packages/ai's vitest run)
+#   can go quiet for a long stretch on 4 vCPUs, and the default would kill an
+#   otherwise healthy run.
+# ---------------------------------------------------------------------------
+
+jobs:
+  build-and-test:
+    docker:
+      - image: cimg/node:22.23.2
+    resource_class: large
+    environment:
+      SKIP_RSC_E2E: '1'
+      TURBO_TELEMETRY_DISABLED: '1'
+      NEXT_TELEMETRY_DISABLED: '1'
+      DO_NOT_TRACK: '1'
+    steps:
+      - checkout
+
+      - run:
+          name: Install dependencies (pnpm, frozen lockfile)
+          command: circleci run circleci/setup-node@0.0.1-15ea7e5 -- install
+
+      - run:
+          name: Build
+          command: pnpm exec turbo build --filter='!@example/*' --concurrency 4
+          no_output_timeout: 20m
+
+      - run:
+          name: Test
+          command: pnpm exec turbo test --filter='!@example/*' --concurrency 4
+          no_output_timeout: 30m
+
+workflows:
+  # No trigger filters: a 2.1 workflow with no branch/tag filters runs on every
+  # push to every branch, which is what we want as the push gate.
+  build-and-test:
+    jobs:
+      - build-and-test
